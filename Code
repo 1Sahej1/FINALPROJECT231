@@ -1,0 +1,589 @@
+"""
+Advanced Video Object Tracking System
+=====================================
+Implements multi-technique feature matching across video frames:
+- Image filtering (Gaussian blur)
+- SIFT feature detection and matching
+- Harris corner detection for filtering
+- Optical flow consistency validation
+
+Author: Computer Vision Project
+"""
+
+import cv2
+import numpy as np
+from typing import Tuple, List, Optional
+from dataclasses import dataclass
+
+
+@dataclass
+class TrackerConfig:
+    """Configuration parameters for the tracking system"""
+    # Video settings
+    video_path: str = "Gorilla Walks.mp4"
+    display_fps: int = 30
+
+    # Feature detection
+    max_features: int = 1000
+    gaussian_kernel: Tuple[int, int] = (5, 5)
+    gaussian_sigma: float = 1.0
+
+    # SIFT matching
+    ratio_threshold: float = 0.75  # Lowe's ratio test
+    min_match_count: int = 10
+
+    # Harris corner parameters
+    harris_block_size: int = 2
+    harris_ksize: int = 3
+    harris_k: float = 0.04
+    harris_threshold: float = 0.01  # Percentage of max response
+
+    # Optical flow
+    flow_win_size: Tuple[int, int] = (21, 21)
+    flow_max_level: int = 3
+    flow_criteria: Tuple = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+    flow_min_eig_threshold: float = 1e-4
+    flow_max_distance: float = 30.0  # Max pixel displacement
+    flow_fb_threshold: float = 2.0  # Forward-backward error threshold
+
+
+class VideoObjectTracker:
+    """Main tracker class implementing all computer vision techniques"""
+
+    def __init__(self, config: TrackerConfig):
+        self.config = config
+        self.cap = cv2.VideoCapture(config.video_path)
+
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {config.video_path}")
+
+        # Initialize SIFT detector
+        self.sift = cv2.SIFT_create(config.max_features)
+
+        # Optical flow parameters
+        self.lk_params = dict(
+            winSize=config.flow_win_size,
+            maxLevel=config.flow_max_level,
+            criteria=config.flow_criteria,
+            minEigThreshold=config.flow_min_eig_threshold
+        )
+
+        # State variables
+        self.prev_frame = None
+        self.prev_filtered = None
+        self.prev_keypoints = None
+        self.prev_descriptors = None
+
+        # Statistics
+        self.frame_count = 0
+        self.stats = {
+            'total_sift': 0,
+            'harris_filtered': 0,
+            'matched': 0,
+            'flow_validated': 0
+        }
+
+    def apply_gaussian_filter(self, image: np.ndarray) -> np.ndarray:
+        """
+        Apply Gaussian blur to reduce noise and improve feature detection
+
+        Args:
+            image: Grayscale input image
+
+        Returns:
+            Filtered image
+        """
+        return cv2.GaussianBlur(
+            image,
+            self.config.gaussian_kernel,
+            self.config.gaussian_sigma
+        )
+
+    def detect_harris_corners(self, image: np.ndarray) -> np.ndarray:
+        """
+        Detect Harris corners for filtering high-quality feature points
+
+        Args:
+            image: Filtered grayscale image
+
+        Returns:
+            Binary mask of corner locations
+        """
+        # Convert to float32 as required by Harris detector
+        image_float = np.float32(image)
+
+        # Detect corners
+        harris_response = cv2.cornerHarris(
+            image_float,
+            self.config.harris_block_size,
+            self.config.harris_ksize,
+            self.config.harris_k
+        )
+
+        # Dilate to mark corner regions
+        harris_response = cv2.dilate(harris_response, None)
+
+        # Threshold to get binary mask
+        threshold = self.config.harris_threshold * harris_response.max()
+        corner_mask = harris_response > threshold
+
+        return corner_mask.astype(np.uint8) * 255
+
+    def visualize_harris(self, frame: np.ndarray, corner_mask: np.ndarray) -> np.ndarray:
+        """Create visualization of Harris corners"""
+        vis = frame.copy()
+        vis[corner_mask > 0] = [0, 0, 255]  # Red corners
+        return vis
+
+    def detect_sift_features(self, image: np.ndarray) -> Tuple[List, np.ndarray]:
+        """
+        Detect SIFT keypoints and descriptors
+
+        Args:
+            image: Filtered grayscale image
+
+        Returns:
+            Tuple of (keypoints, descriptors)
+        """
+        keypoints, descriptors = self.sift.detectAndCompute(image, None)
+        return keypoints, descriptors
+
+    def filter_keypoints_by_harris(
+            self,
+            keypoints: List,
+            descriptors: np.ndarray,
+            corner_mask: np.ndarray,
+            radius: int = 5
+    ) -> Tuple[List, np.ndarray]:
+        """
+        Filter SIFT keypoints to keep only those near Harris corners
+
+        Args:
+            keypoints: SIFT keypoints
+            descriptors: SIFT descriptors
+            corner_mask: Binary mask of Harris corners
+            radius: Search radius around keypoint
+
+        Returns:
+            Filtered keypoints and descriptors
+        """
+        if descriptors is None or len(keypoints) == 0:
+            return keypoints, descriptors
+
+        filtered_kp = []
+        filtered_desc = []
+
+        for i, kp in enumerate(keypoints):
+            x, y = int(kp.pt[0]), int(kp.pt[1])
+
+            # Check if point is within image bounds
+            if 0 <= y < corner_mask.shape[0] and 0 <= x < corner_mask.shape[1]:
+                # Check neighborhood for Harris corners
+                y_min = max(0, y - radius)
+                y_max = min(corner_mask.shape[0], y + radius + 1)
+                x_min = max(0, x - radius)
+                x_max = min(corner_mask.shape[1], x + radius + 1)
+
+                neighborhood = corner_mask[y_min:y_max, x_min:x_max]
+
+                if np.any(neighborhood > 0):
+                    filtered_kp.append(kp)
+                    filtered_desc.append(descriptors[i])
+
+        if len(filtered_desc) > 0:
+            return filtered_kp, np.array(filtered_desc)
+        else:
+            return [], None
+
+    def match_features(
+            self,
+            desc1: np.ndarray,
+            desc2: np.ndarray
+    ) -> List[cv2.DMatch]:
+        """
+        Match features using KNN with Lowe's ratio test
+
+        Args:
+            desc1: Descriptors from previous frame
+            desc2: Descriptors from current frame
+
+        Returns:
+            List of good matches
+        """
+        if desc1 is None or desc2 is None:
+            return []
+
+        # BFMatcher with L2 norm (for SIFT)
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+        try:
+            # KNN matching with k=2
+            knn_matches = bf.knnMatch(desc1, desc2, k=2)
+        except cv2.error:
+            return []
+
+        # Apply Lowe's ratio test
+        good_matches = []
+        for match_pair in knn_matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < self.config.ratio_threshold * n.distance:
+                    good_matches.append(m)
+
+        return good_matches
+
+    def validate_with_optical_flow(
+            self,
+            matches: List[cv2.DMatch],
+            kp_prev: List,
+            kp_curr: List,
+            img_prev: np.ndarray,
+            img_curr: np.ndarray
+    ) -> Tuple[List[cv2.DMatch], np.ndarray, np.ndarray]:
+        """
+        Validate matches using optical flow with forward-backward consistency
+
+        Args:
+            matches: Feature matches to validate
+            kp_prev: Keypoints from previous frame
+            kp_curr: Keypoints from current frame
+            img_prev: Previous filtered image
+            img_curr: Current filtered image
+
+        Returns:
+            Tuple of (validated_matches, flow_points_prev, flow_points_curr)
+        """
+        if len(matches) == 0:
+            return [], np.array([]), np.array([])
+
+        # Extract point coordinates
+        pts_prev = np.float32([kp_prev[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+        # Forward flow
+        pts_flow, status_fwd, error = cv2.calcOpticalFlowPyrLK(
+            img_prev, img_curr, pts_prev, None, **self.lk_params
+        )
+
+        # Backward flow for consistency check
+        pts_back, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
+            img_curr, img_prev, pts_flow, None, **self.lk_params
+        )
+
+        # Filter matches based on flow consistency
+        validated_matches = []
+        flow_pts_prev = []
+        flow_pts_curr = []
+
+        for i, match in enumerate(matches):
+            if status_fwd[i] and status_bwd[i]:
+                p_prev = pts_prev[i].ravel()
+                p_flow = pts_flow[i].ravel()
+                p_back = pts_back[i].ravel()
+
+                # Calculate forward-backward error
+                fb_error = np.linalg.norm(p_prev - p_back)
+
+                # Calculate flow magnitude
+                flow_magnitude = np.linalg.norm(p_flow - p_prev)
+
+                # Validate
+                if (flow_magnitude < self.config.flow_max_distance and
+                        fb_error < self.config.flow_fb_threshold):
+                    validated_matches.append(match)
+                    flow_pts_prev.append(p_prev)
+                    flow_pts_curr.append(p_flow)
+
+        return validated_matches, np.array(flow_pts_prev), np.array(flow_pts_curr)
+
+    def visualize_optical_flow(
+            self,
+            frame: np.ndarray,
+            pts_prev: np.ndarray,
+            pts_curr: np.ndarray
+    ) -> np.ndarray:
+        """Create visualization of optical flow vectors"""
+        vis = frame.copy()
+
+        if len(pts_prev) == 0:
+            return vis
+
+        for p_prev, p_curr in zip(pts_prev, pts_curr):
+            x1, y1 = int(p_prev[0]), int(p_prev[1])
+            x2, y2 = int(p_curr[0]), int(p_curr[1])
+
+            # Calculate flow magnitude for color coding
+            flow_mag = np.linalg.norm(p_curr - p_prev)
+
+            # Color code: green (slow) -> yellow (medium) -> red (fast)
+            if flow_mag < 5:
+                color = (0, 255, 0)  # Green
+            elif flow_mag < 15:
+                color = (0, 255, 255)  # Yellow
+            else:
+                color = (0, 165, 255)  # Orange
+
+            # Draw flow vector
+            cv2.arrowedLine(vis, (x1, y1), (x2, y2), color, 2, tipLength=0.3)
+            cv2.circle(vis, (x1, y1), 4, (255, 0, 0), -1)  # Blue start point
+
+        return vis
+
+    def create_dashboard(
+            self,
+            frame: np.ndarray,
+            filtered: np.ndarray,
+            harris_vis: np.ndarray,
+            sift_vis: np.ndarray,
+            flow_vis: np.ndarray,
+            match_vis: np.ndarray
+    ) -> np.ndarray:
+        """Create a comprehensive dashboard view"""
+        h, w = frame.shape[:2]
+
+        # Resize images to fit in grid
+        size = (w // 2, h // 2)
+
+        def resize_img(img):
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            return cv2.resize(img, size)
+
+        # Create 2x2 grid for main views
+        top_row = np.hstack([
+            resize_img(filtered),
+            resize_img(harris_vis)
+        ])
+
+        bottom_row = np.hstack([
+            resize_img(sift_vis),
+            resize_img(flow_vis)
+        ])
+
+        grid = np.vstack([top_row, bottom_row])
+
+        # Add labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(grid, "1. Gaussian Filtered", (10, 30), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(grid, "2. Harris Corners", (w // 2 + 10, 30), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(grid, "3. SIFT Features", (10, h // 2 + 30), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(grid, "4. Optical Flow", (w // 2 + 10, h // 2 + 30), font, 0.7, (255, 255, 255), 2)
+
+        # Add statistics overlay
+        stats_text = [
+            f"Frame: {self.frame_count}",
+            f"SIFT Features: {self.stats['total_sift']}",
+            f"Harris Filtered: {self.stats['harris_filtered']}",
+            f"Matches: {self.stats['matched']}",
+            f"Flow Validated: {self.stats['flow_validated']}"
+        ]
+
+        y_offset = h - 150
+        for i, text in enumerate(stats_text):
+            cv2.putText(grid, text, (10, y_offset + i * 30),
+                        font, 0.6, (0, 255, 0), 2)
+
+        return grid
+
+    def process_frame(self, frame: np.ndarray) -> dict:
+        """
+        Process a single frame through the complete pipeline
+
+        Args:
+            frame: BGR input frame
+
+        Returns:
+            Dictionary containing all visualizations and results
+        """
+        self.frame_count += 1
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 1. Apply Gaussian filtering
+        filtered = self.apply_gaussian_filter(gray)
+
+        # 2. Detect Harris corners
+        harris_mask = self.detect_harris_corners(filtered)
+        harris_vis = self.visualize_harris(frame, harris_mask)
+
+        # 3. Detect SIFT features
+        keypoints, descriptors = self.detect_sift_features(filtered)
+        self.stats['total_sift'] = len(keypoints)
+
+        # Filter SIFT by Harris corners
+        keypoints_filtered, descriptors_filtered = self.filter_keypoints_by_harris(
+            keypoints, descriptors, harris_mask
+        )
+        self.stats['harris_filtered'] = len(keypoints_filtered) if keypoints_filtered else 0
+
+        # Visualize SIFT
+        sift_vis = cv2.drawKeypoints(
+            frame, keypoints_filtered, None,
+            flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
+        )
+
+        # Initialize results
+        results = {
+            'frame': frame,
+            'filtered': filtered,
+            'harris_vis': harris_vis,
+            'sift_vis': sift_vis,
+            'flow_vis': frame.copy(),
+            'match_vis': None,
+            'validated_matches': []
+        }
+
+        # If this is the first frame, initialize state
+        if self.prev_descriptors is None:
+            self.prev_frame = frame.copy()
+            self.prev_filtered = filtered
+            self.prev_keypoints = keypoints_filtered
+            self.prev_descriptors = descriptors_filtered
+            return results
+
+        # 4. Match features with previous frame
+        matches = self.match_features(self.prev_descriptors, descriptors_filtered)
+        self.stats['matched'] = len(matches)
+
+        if len(matches) >= self.config.min_match_count:
+            # 5. Validate with optical flow
+            validated_matches, flow_pts_prev, flow_pts_curr = self.validate_with_optical_flow(
+                matches,
+                self.prev_keypoints,
+                keypoints_filtered,
+                self.prev_filtered,
+                filtered
+            )
+            self.stats['flow_validated'] = len(validated_matches)
+
+            # Visualize optical flow
+            results['flow_vis'] = self.visualize_optical_flow(
+                frame, flow_pts_prev, flow_pts_curr
+            )
+
+            # Add statistics to flow visualization
+            cv2.putText(results['flow_vis'],
+                        f"Tracked: {len(validated_matches)}/{len(matches)}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # Create match visualization
+            if len(validated_matches) > 0:
+                results['match_vis'] = cv2.drawMatches(
+                    self.prev_frame, self.prev_keypoints,
+                    frame, keypoints_filtered,
+                    validated_matches[:50],  # Show top 50 matches
+                    None,
+                    matchColor=(0, 255, 0),
+                    singlePointColor=(255, 0, 0),
+                    flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                )
+
+                results['validated_matches'] = validated_matches
+
+        # Update state
+        self.prev_frame = frame.copy()
+        self.prev_filtered = filtered
+        self.prev_keypoints = keypoints_filtered
+        self.prev_descriptors = descriptors_filtered
+
+        return results
+
+    def run(self, show_dashboard: bool = False):
+        """
+        Main tracking loop
+
+        Args:
+            show_dashboard: If True, show combined dashboard view
+        """
+        print("=" * 60)
+        print("Video Object Tracking System")
+        print("=" * 60)
+        print(f"Video: {self.config.video_path}")
+        print(f"Max Features: {self.config.max_features}")
+        print(f"SIFT Ratio Threshold: {self.config.ratio_threshold}")
+        print(f"Flow Max Distance: {self.config.flow_max_distance}")
+        print("\nPress ESC to exit, SPACE to pause")
+        print("=" * 60)
+
+        paused = False
+
+        while True:
+            if not paused:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("\nEnd of video reached")
+                    break
+
+                # Process frame
+                results = self.process_frame(frame)
+
+                if show_dashboard:
+                    # Show combined dashboard
+                    match_vis = results['match_vis'] if results['match_vis'] is not None else frame
+                    dashboard = self.create_dashboard(
+                        results['frame'],
+                        results['filtered'],
+                        results['harris_vis'],
+                        results['sift_vis'],
+                        results['flow_vis'],
+                        match_vis
+                    )
+                    cv2.imshow("Tracking Dashboard", dashboard)
+                else:
+                    # Show individual windows
+                    cv2.imshow("1 - Filtered Image", results['filtered'])
+                    cv2.imshow("2 - Harris Corners", results['harris_vis'])
+                    cv2.imshow("3 - SIFT Keypoints", results['sift_vis'])
+                    cv2.imshow("4 - Optical Flow", results['flow_vis'])
+
+                    if results['match_vis'] is not None:
+                        cv2.imshow("5 - Final Matching", results['match_vis'])
+
+            # Handle keyboard input
+            key = cv2.waitKey(self.config.display_fps) & 0xFF
+
+            if key == 27:  # ESC
+                break
+            elif key == 32:  # SPACE
+                paused = not paused
+                print("Paused" if paused else "Resumed")
+            elif key == ord('d'):  # Toggle dashboard
+                show_dashboard = not show_dashboard
+                cv2.destroyAllWindows()
+
+        # Cleanup
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+        # Print final statistics
+        print("\n" + "=" * 60)
+        print("Final Statistics")
+        print("=" * 60)
+        print(f"Total Frames Processed: {self.frame_count}")
+        print(f"Average SIFT Features: {self.stats['total_sift']}")
+        print(f"Average Harris Filtered: {self.stats['harris_filtered']}")
+        print(f"Average Matches: {self.stats['matched']}")
+        print(f"Average Flow Validated: {self.stats['flow_validated']}")
+        print("=" * 60)
+
+
+def main():
+    """Main entry point"""
+    # Create configuration
+    config = TrackerConfig(
+        video_path="Gorilla Walks.mp4",
+        max_features=1000,
+        ratio_threshold=0.75,
+        flow_max_distance=30.0,
+        flow_fb_threshold=2.0
+    )
+
+    # Create and run tracker
+    tracker = VideoObjectTracker(config)
+
+    # Run with dashboard view (set to False for individual windows)
+    tracker.run(show_dashboard=False)
+
+
+if __name__ == "__main__":
+    main()
